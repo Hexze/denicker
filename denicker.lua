@@ -1,13 +1,9 @@
--- Denicker Plugin
--- Detects and resolves nicked players on Hypixel
--- Adapted from Pug's Denicker Raven script (github.com/PugrillaDev)
-
 plugin = {
     name = "denicker",
     displayName = "Nick Alerts",
     prefix = "§cDN",
-    version = "1.3.0",
-    credits = "Hexze",
+    version = "1.4.0",
+    credits = "",
     description = "Detects and resolves nicked players, and tracks nick changes on your ignore list"
 }
 
@@ -30,7 +26,8 @@ local function getConfig(key, default)
     return default
 end
 
--- Register config schema
+-- Config schema
+
 starfish.schema.section({
     key = "alerts",
     label = "Alerts",
@@ -96,6 +93,7 @@ starfish.schema.section({
 })
 
 -- Known nick skin hashes
+
 local KNOWN_NICK_SKINS = {
     ["4c7b0468044bfecacc43d00a3a69335a834b73937688292c20d3988cae58248d"] = true,
     ["3b60a1f6d562f52aaebbf1434f1de147933a3affe0e764fa49ea057536623cd3"] = true,
@@ -326,7 +324,8 @@ local KNOWN_NICK_SKINS = {
     ["1d9e8dafe7d87bb7cba7eb3d8d2d5bf58eab72ecdfdf9ecce3d1c03871c0"] = true,
 }
 
--- Reset state on respawn/disconnect
+-- Display names
+
 local function reset()
     parsed = {}
     nickDisplayNames = {}
@@ -335,7 +334,6 @@ local function reset()
     resolvedNicks = {}
 end
 
--- Clear all display name modifications
 local function clearDisplayNames()
     for uuid, _ in pairs(nickDisplayNames) do
         starfish.display.clearSuffix(uuid)
@@ -343,7 +341,6 @@ local function clearDisplayNames()
     starfish.debug("Cleared all denicker display names")
 end
 
--- Set nick display name suffix
 local function setNickDisplayName(uuid, nickName, realName)
     nickDisplayNames[uuid] = { nickName = nickName, realName = realName }
 
@@ -358,7 +355,8 @@ local function setNickDisplayName(uuid, nickName, realName)
     end
 end
 
--- Send alert to chat
+-- Alerts
+
 local function sendAlert(playerName, realName)
     if not getConfig("alerts.enabled", true) then
         return
@@ -386,7 +384,6 @@ local function sendAlert(playerName, realName)
     end
 end
 
--- Send Cubelify message
 local function sendCubelifyMessage(realName)
     if not getConfig("addNicksToCubelify.enabled", true) then
         return
@@ -419,12 +416,18 @@ local function findIgnoreEntry(name)
     if ignoreEntries[name] then
         return name, ignoreEntries[name]
     end
+    local lowered = name:lower()
     for currentName, entry in pairs(ignoreEntries) do
-        if entry.originalName == name then
+        if currentName:lower() == lowered or (entry.originalName or ""):lower() == lowered then
             return currentName, entry
         end
     end
     return nil
+end
+
+local function formatNote(entry)
+    if not entry or not entry.note then return "" end
+    return " §7- \"" .. entry.note .. "\""
 end
 
 local function ignoreAlert(message)
@@ -477,10 +480,11 @@ local function processFullListDiff(listedNames)
         local oldEntry = ignoreEntries[oldName]
         ignoreEntries[newName] = {
             addedAt = oldEntry.addedAt,
-            originalName = oldEntry.originalName or oldName
+            originalName = oldEntry.originalName or oldName,
+            note = oldEntry.note
         }
         ignoreEntries[oldName] = nil
-        ignoreAlert("§6" .. (oldEntry.originalName or oldName) .. " §7changed their nick: §c" .. oldName .. " §7→ §a" .. newName .. " §8(added " .. formatAge(oldEntry.addedAt) .. ")")
+        ignoreAlert("§6" .. (oldEntry.originalName or oldName) .. " §7changed their nick: §c" .. oldName .. " §7→ §a" .. newName .. " §8(added " .. formatAge(oldEntry.addedAt) .. ")" .. formatNote(oldEntry))
     else
         for _, name in ipairs(reveals) do
             ignoreEntries[name] = { addedAt = os.time(), originalName = name }
@@ -556,10 +560,22 @@ local function onListPageHeader(page, totalPages)
     end
 end
 
+local function promptForNote(name)
+    starfish.chat.sendRaw(starfish.http.jsonEncode({
+        text = starfish.chat.prefix("§7Blocked §c" .. name .. "§7. "),
+        extra = {{
+            text = "§8[§aadd note§8]",
+            hoverEvent = { action = "show_text", value = "§7Record why you blocked §c" .. name },
+            clickEvent = { action = "suggest_command", value = "/denicker note " .. name .. " " }
+        }}
+    }))
+end
+
 local function onIgnoreChat(message)
     local blockedName = message:match("^Blocked (.+)%.$")
     if blockedName then
         pendingBlocks[blockedName] = os.time()
+        promptForNote(blockedName)
         return
     end
 
@@ -596,7 +612,8 @@ local function onIgnoreChat(message)
     end
 end
 
--- Parse skin data to detect nicks
+-- Nick detection
+
 local function parseSkinData(player, team)
     local uuid = player.uuid
     local name = player.name
@@ -611,7 +628,6 @@ local function parseSkinData(player, team)
 
     if not properties then return end
 
-    -- Find textures property
     local textureProp = nil
     for i = 1, #properties do
         if properties[i].name == "textures" then
@@ -622,7 +638,6 @@ local function parseSkinData(player, team)
 
     if not textureProp or not textureProp.value then return end
 
-    -- Decode base64 skin data
     local skinDataJson = starfish.base64.decode(textureProp.value)
     if not skinDataJson then return end
 
@@ -634,15 +649,11 @@ local function parseSkinData(player, team)
     local url = skinData.textures.SKIN.url
     if not url then return end
 
-    -- Extract hash from URL
     local hash = url:match("[^/]+$")
-
-    -- Get team formatting
     local prefix = team and team.prefix or ""
     local suffix = team and team.suffix or ""
     local teamFormattedName = prefix .. name .. suffix
 
-    -- Check if known nick skin
     if KNOWN_NICK_SKINS[hash] then
         starfish.debug("Unresolved nick: " .. name)
         if getConfig("showUnresolvedNicks.enabled", true) then
@@ -652,7 +663,6 @@ local function parseSkinData(player, team)
         return
     end
 
-    -- Check for resolved nick
     local realName = skinData.profileName
     if realName and realName ~= name then
         starfish.debug("Resolved nick: " .. name .. " -> " .. realName)
@@ -668,12 +678,11 @@ local function parseSkinData(player, team)
 
         local _, entry = findIgnoreEntry(realName)
         if entry then
-            ignoreAlert("§6" .. realName .. " §7is on your ignore list §8(added " .. formatAge(entry.addedAt) .. ")")
+            ignoreAlert("§6" .. realName .. " §7is on your ignore list §8(added " .. formatAge(entry.addedAt) .. ")" .. formatNote(entry))
         end
     end
 end
 
--- Handle player_info packet
 local function onPlayerInfo(event)
     if event.action ~= 0 then return end
 
@@ -703,7 +712,6 @@ local function onPlayerInfo(event)
     end
 end
 
--- Handle team update event
 local function onTeamUpdate(event)
     local mode = event.mode
     if mode == 0 or mode == 2 or mode == 3 then
@@ -719,13 +727,13 @@ local function onTeamUpdate(event)
     end
 end
 
--- Handle respawn event
+-- Event wiring
+
 local function onRespawn(event)
     clearDisplayNames()
     reset()
 end
 
--- Handle plugin restored event
 local function onPluginRestored(event)
     if event.pluginName == "denicker" then
         parsed = {}
@@ -734,7 +742,6 @@ local function onPluginRestored(event)
     end
 end
 
--- Reapply all display name modifications based on current config
 local function reapplyDisplayNames()
     if not getConfig("modifyDisplayNames.enabled", true) then
         return
@@ -750,7 +757,6 @@ local function reapplyDisplayNames()
     end
 end
 
--- Handle config changes
 local function onConfigChanged(event)
     if event.plugin ~= "denicker" then
         return
@@ -772,13 +778,11 @@ local function onConfigChanged(event)
     end
 end
 
--- Handle chat for ignore list tracking
 local function onChat(event)
     if event.position == 2 then return end
     onIgnoreChat(stripColors(event.message or ""))
 end
 
--- Register event handlers
 starfish.events.on("player_info", onPlayerInfo)
 starfish.events.on("scoreboard_team", onTeamUpdate)
 starfish.events.on("chat", onChat)
@@ -786,10 +790,10 @@ starfish.events.on("respawn", onRespawn)
 starfish.events.on("plugin_restored", onPluginRestored)
 starfish.events.on("config_changed", onConfigChanged)
 
--- Load persisted ignore entries
 ignoreEntries = starfish.config.get("ignoreEntries") or {}
 
--- Register commands
+-- Commands
+
 starfish.commands.register("sync", {
     description = "Sync your ignore list by paging through /ignore list"
 }, function()
@@ -819,11 +823,79 @@ starfish.commands.register("changed", {
 
     starfish.chat.send(starfish.chat.prefix("§7Nick changes detected (" .. #changed .. "):"))
     for _, item in ipairs(changed) do
-        starfish.chat.send(starfish.chat.prefix("§c" .. item.entry.originalName .. " §7→ §a" .. item.name .. " §8(added " .. formatAge(item.entry.addedAt) .. ")"))
+        starfish.chat.send(starfish.chat.prefix("§c" .. item.entry.originalName .. " §7→ §a" .. item.name .. " §8(added " .. formatAge(item.entry.addedAt) .. ")" .. formatNote(item.entry)))
     end
 end)
 
--- Export public API for other plugins
+starfish.commands.register("note", {
+    description = "Record why you blocked a player (no text shows it, \"clear\" removes it)",
+    arguments = {
+        starfish.commands.arg("player", "Blocked player's name"),
+        starfish.commands.greedy("text", "Note text")
+    }
+}, function(args)
+    if #args == 0 then
+        starfish.chat.send(starfish.chat.error("Usage: /denicker note <player> [text]"))
+        return
+    end
+
+    local name, entry = findIgnoreEntry(args[1])
+    if not entry then
+        starfish.chat.send(starfish.chat.error(args[1] .. " is not on your tracked ignore list. Run /denicker sync first."))
+        return
+    end
+
+    local text = table.concat(args, " ", 2)
+    if text == "" then
+        if entry.note then
+            starfish.chat.send(starfish.chat.prefix("§c" .. name .. formatNote(entry)))
+        else
+            starfish.chat.send(starfish.chat.prefix("§7No note for §c" .. name .. "§7. Add one: §f/denicker note " .. name .. " <text>"))
+        end
+        return
+    end
+
+    if text == "clear" then
+        entry.note = nil
+        saveIgnoreEntries()
+        starfish.chat.send(starfish.chat.success("Cleared the note for " .. name .. "."))
+        return
+    end
+
+    entry.note = text
+    saveIgnoreEntries()
+    starfish.chat.send(starfish.chat.success("Noted for " .. name .. ": §7\"" .. text .. "\""))
+end)
+
+starfish.commands.register("list", {
+    description = "List tracked ignore entries with their notes"
+}, function()
+    local entries = {}
+    for name, entry in pairs(ignoreEntries) do
+        table.insert(entries, { name = name, entry = entry })
+    end
+
+    if #entries == 0 then
+        starfish.chat.send(starfish.chat.prefix("§7No tracked players. Run /denicker sync to import your ignore list."))
+        return
+    end
+
+    table.sort(entries, function(a, b)
+        return (a.entry.addedAt or 0) < (b.entry.addedAt or 0)
+    end)
+
+    starfish.chat.send(starfish.chat.prefix("§7Tracked ignore list (" .. #entries .. "):"))
+    for _, item in ipairs(entries) do
+        local renamed = ""
+        if item.entry.originalName and item.entry.originalName ~= item.name then
+            renamed = " §8(was " .. item.entry.originalName .. ")"
+        end
+        starfish.chat.send(starfish.chat.prefix("§c" .. item.name .. renamed .. " §8(added " .. formatAge(item.entry.addedAt) .. ")" .. formatNote(item.entry)))
+    end
+end)
+
+-- Exports
+
 starfish.api.export("isNicked", function(playerName)
     for uuid, data in pairs(nickDisplayNames) do
         if data.nickName == playerName then
@@ -854,10 +926,17 @@ starfish.api.export("isIgnored", function(name)
     return findIgnoreEntry(name) ~= nil
 end)
 
+starfish.api.export("getIgnoreEntry", function(name)
+    if not name then return nil end
+    local currentName, entry = findIgnoreEntry(name)
+    if not entry then return nil end
+    return { name = currentName, addedAt = entry.addedAt, originalName = entry.originalName, note = entry.note }
+end)
+
 starfish.api.export("getIgnoreEntries", function()
     local result = {}
     for name, entry in pairs(ignoreEntries) do
-        result[name] = { addedAt = entry.addedAt, originalName = entry.originalName }
+        result[name] = { addedAt = entry.addedAt, originalName = entry.originalName, note = entry.note }
     end
     return result
 end)
