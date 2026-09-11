@@ -2,29 +2,22 @@ plugin = {
     name = "denicker",
     displayName = "Nick Alerts",
     prefix = "§cDN",
-    version = "1.4.0",
-    credits = "",
+    version = "1.5.0",
+    author = "pugbw, hxrmcny",
+    credits = "pugbw, hxrmcny",
     description = "Detects and resolves nicked players, and tracks nick changes on your ignore list"
 }
 
--- State
-local parsed = {}
-local nickDisplayNames = {}
-local pendingChecks = {}
-local teamDataReceived = {}
-local resolvedNicks = {}
+-- Constants
 
-local ignoreEntries = {}
-local pendingBlocks = {}
-local listParse = { active = false, totalPages = 1, pagesSeen = {}, names = {}, timer = nil }
-local syncing = false
-
--- Config helpers
-local function getConfig(key, default)
-    local val = starfish.config.get(key)
-    if val ~= nil then return val end
-    return default
-end
+local UNKNOWN_ACCOUNT = "unknown"
+local MOJANG_PROFILE_URL = "https://api.mojang.com/users/profiles/minecraft/"
+local BLOCK_LIST_COMMAND = "/block list "
+local PAGE_REQUEST_MS = 600
+local LIST_SETTLE_MS = 1500
+local AUTO_SYNC_MS = 90000
+local COMMAND_QUIET_MS = 500
+local RESPONSE_TIMEOUT_MS = 5000
 
 -- Config schema
 
@@ -32,17 +25,10 @@ starfish.schema.section({
     key = "alerts",
     label = "Alerts",
     description = "Configure the plugin's chat alerts.",
-    defaults = {
-        alerts = {
-            enabled = true,
-            audioAlerts = { enabled = true },
-            alertDelay = 1000
-        }
-    },
     settings = {
         { key = "alerts.enabled", type = "toggle", default = true, description = "Enable or disable all chat alerts." },
         { key = "alerts.audioAlerts.enabled", type = "soundToggle", default = true, description = "Play a sound when an alert is triggered." },
-        { key = "alerts.alertDelay", type = "cycle", description = "The delay in milliseconds before sending a nick alert.", displayLabel = "Delay", values = {
+        { key = "alerts.alertDelay", type = "cycle", default = 1000, description = "The delay in milliseconds before sending a nick alert.", displayLabel = "Delay", values = {
             { text = "0ms", value = 0 },
             { text = "500ms", value = 500 },
             { text = "1000ms", value = 1000 },
@@ -55,7 +41,6 @@ starfish.schema.section({
     key = "modifyDisplayNames",
     label = "Label Nicks in Tab",
     description = "Enable or disable tab suffixes for nicked players.",
-    defaults = { modifyDisplayNames = { enabled = true } },
     settings = {
         { key = "modifyDisplayNames.enabled", type = "toggle", default = true, description = "Adds a label to nicked players in tab to indicate they are nicked (and show their real name if available)." },
     }
@@ -65,7 +50,6 @@ starfish.schema.section({
     key = "showUnresolvedNicks",
     label = "Unresolved Nicks",
     description = "Enable or disable alerts for unresolved nicks.",
-    defaults = { showUnresolvedNicks = { enabled = true } },
     settings = {
         { key = "showUnresolvedNicks.enabled", type = "toggle", default = true, description = "Alerts for players who are nicked but could not be linked to a real name." },
     }
@@ -73,11 +57,11 @@ starfish.schema.section({
 
 starfish.schema.section({
     key = "ignoreList",
-    label = "Ignore List Tracking",
-    description = "Track your /ignore list and detect nick changes.",
-    defaults = { ignoreList = { enabled = true, sound = { enabled = true } } },
+    label = "Block List Tracker",
+    description = "Track your block list, annotate it in game, and catch nick changes.",
     settings = {
-        { key = "ignoreList.enabled", type = "toggle", default = true, description = "Alert when a name on your ignore list changes (a nicked player's new nick becomes visible)." },
+        { key = "ignoreList.enabled", type = "toggle", default = true, description = "Track your block list and show what Starfish knows about it in /block list." },
+        { key = "ignoreList.auto", type = "toggle", default = true, displayLabel = "Auto", description = "Silently re-check your block list every 90 seconds, hiding the server's reply." },
         { key = "ignoreList.sound.enabled", type = "soundToggle", default = true, description = "Play a sound on nick-change alerts." },
     }
 })
@@ -86,11 +70,482 @@ starfish.schema.section({
     key = "addNicksToCubelify",
     label = "Add Nicks to Cubelify",
     description = "Automatically add denicked players to Cubelify.",
-    defaults = { addNicksToCubelify = { enabled = true } },
     settings = {
         { key = "addNicksToCubelify.enabled", type = "toggle", default = true, description = "Sends a message that cubelify will read to manually add denicked players to your overlay." },
     }
 })
+
+-- Account storage
+
+local ignoreEntries = {}
+local loadedAccount = nil
+
+local function currentAccount()
+    local me = starfish.players.me()
+    return (me and me.uuid) or UNKNOWN_ACCOUNT
+end
+
+local function saveIgnoreEntries()
+    local accounts = starfish.config.get("accounts") or {}
+    accounts[currentAccount()] = ignoreEntries
+    starfish.config.set("accounts", accounts)
+end
+
+local function loadIgnoreEntries()
+    local accounts = starfish.config.get("accounts") or {}
+    ignoreEntries = accounts[currentAccount()] or {}
+    loadedAccount = currentAccount()
+end
+
+local function syncAccount()
+    if loadedAccount ~= currentAccount() then
+        loadIgnoreEntries()
+    end
+end
+
+-- Entry tracking
+
+local pendingBlocks = {}
+
+local function findIgnoreEntry(name)
+    if ignoreEntries[name] then
+        return name, ignoreEntries[name]
+    end
+    local lowered = name:lower()
+    for currentName, entry in pairs(ignoreEntries) do
+        if currentName:lower() == lowered or (entry.originalName or ""):lower() == lowered then
+            return currentName, entry
+        end
+    end
+    return nil
+end
+
+local function formatAge(timestamp)
+    if not timestamp then return "unknown" end
+    local delta = os.time() - timestamp
+    if delta < 60 then return delta .. "s ago" end
+    if delta < 3600 then return math.floor(delta / 60) .. "m ago" end
+    if delta < 86400 then return math.floor(delta / 3600) .. "h ago" end
+    return math.floor(delta / 86400) .. "d ago"
+end
+
+local function formatNote(entry)
+    if not entry or not entry.note then return "" end
+    return " §7- \"" .. entry.note .. "\""
+end
+
+local function resolveAccount(name)
+    starfish.http.get(MOJANG_PROFILE_URL .. name, function(res)
+        local entry = ignoreEntries[name]
+        if not entry then return end
+
+        entry.mojangId = res.success and res.data and res.data.id or nil
+        entry.isNick = entry.mojangId == nil
+        saveIgnoreEntries()
+    end)
+end
+
+local function trackEntry(name, addedAt)
+    ignoreEntries[name] = { addedAt = addedAt or os.time(), originalName = name }
+    resolveAccount(name)
+end
+
+local function ignoreAlert(message)
+    starfish.chat.info(message)
+    if starfish.config.get("ignoreList.sound.enabled") then
+        starfish.client.world.playSound("note.pling", { volume = 1.0, pitch = 1.2 })
+    end
+end
+
+-- Sync engine
+
+local currentServer = nil
+local syncing = false
+local silentSync = false
+local responseTimer = nil
+local listParse = { active = false, totalPages = 1, pagesSeen = {}, names = {}, timer = nil }
+
+local function inLimbo()
+    return currentServer ~= nil and currentServer:lower():find("limbo", 1, true) ~= nil
+end
+
+local function cancelResponseTimeout()
+    if responseTimer then
+        responseTimer:off()
+        responseTimer = nil
+    end
+end
+
+local function resetSync()
+    syncing = false
+    silentSync = false
+    listParse.active = false
+    listParse.names = {}
+    listParse.pagesSeen = {}
+
+    if listParse.timer then
+        listParse.timer:off()
+        listParse.timer = nil
+    end
+    cancelResponseTimeout()
+end
+
+local function abortSync()
+    responseTimer = nil
+    resetSync()
+
+    if not inLimbo() then
+        starfish.chat.info("§cBlock list check timed out.")
+    end
+end
+
+local function sawAllPages()
+    for page = 1, listParse.totalPages do
+        if not listParse.pagesSeen[page] then return false end
+    end
+    return true
+end
+
+local function processFullListDiff(listedNames)
+    local listedSet = {}
+    for _, name in ipairs(listedNames) do
+        listedSet[name] = true
+    end
+
+    local appeared = {}
+    for name in pairs(listedSet) do
+        if not ignoreEntries[name] then
+            table.insert(appeared, name)
+        end
+    end
+
+    local disappeared = {}
+    for name in pairs(ignoreEntries) do
+        if not listedSet[name] then
+            table.insert(disappeared, name)
+        end
+    end
+
+    local reveals = {}
+    for _, name in ipairs(appeared) do
+        if pendingBlocks[name] then
+            trackEntry(name, pendingBlocks[name])
+            pendingBlocks[name] = nil
+        else
+            table.insert(reveals, name)
+        end
+    end
+
+    if #reveals == 1 and #disappeared == 1 then
+        local oldName, newName = disappeared[1], reveals[1]
+        local oldEntry = ignoreEntries[oldName]
+        ignoreEntries[newName] = {
+            addedAt = oldEntry.addedAt,
+            originalName = oldEntry.originalName or oldName,
+            note = oldEntry.note,
+            mojangId = oldEntry.mojangId,
+            isNick = oldEntry.isNick
+        }
+        ignoreEntries[oldName] = nil
+
+        if oldEntry.isNick == false then
+            starfish.log.debug(oldName .. " renamed to " .. newName)
+        else
+            ignoreAlert("§6" .. (oldEntry.originalName or oldName) .. " §7changed their nick: §c" .. oldName .. " §7→ §a" .. newName .. " §8(added " .. formatAge(oldEntry.addedAt) .. ")" .. formatNote(oldEntry))
+        end
+    else
+        for _, name in ipairs(reveals) do
+            trackEntry(name)
+            ignoreAlert("§a" .. name .. " §7appeared on your ignore list.")
+        end
+        for _, name in ipairs(disappeared) do
+            ignoreEntries[name] = nil
+        end
+    end
+
+    saveIgnoreEntries()
+end
+
+local function processPartialListAdditions(listedNames)
+    for _, name in ipairs(listedNames) do
+        if not ignoreEntries[name] then
+            trackEntry(name, pendingBlocks[name])
+            pendingBlocks[name] = nil
+        end
+    end
+    saveIgnoreEntries()
+end
+
+local function finalizeListParse()
+    if not listParse.active then return end
+    listParse.active = false
+
+    if listParse.timer then
+        listParse.timer:off()
+        listParse.timer = nil
+    end
+
+    if #listParse.names > 0 then
+        if sawAllPages() then
+            processFullListDiff(listParse.names)
+        else
+            processPartialListAdditions(listParse.names)
+        end
+    end
+
+    if syncing and not silentSync then
+        local count = 0
+        for _ in pairs(ignoreEntries) do count = count + 1 end
+        starfish.chat.success("Block list synced (" .. count .. " tracked).")
+    end
+
+    syncing = false
+    silentSync = false
+    listParse.names = {}
+    listParse.pagesSeen = {}
+end
+
+local function restartListParseTimer()
+    if listParse.timer then
+        listParse.timer:off()
+    end
+    listParse.timer = starfish.timers.delay(LIST_SETTLE_MS, finalizeListParse)
+end
+
+local function onListPageHeader(page, totalPages)
+    cancelResponseTimeout()
+    if not listParse.active then
+        listParse.active = true
+        listParse.names = {}
+        listParse.pagesSeen = {}
+    end
+    listParse.totalPages = totalPages
+    listParse.pagesSeen[page] = true
+    restartListParseTimer()
+
+    if syncing and page < totalPages then
+        starfish.timers.delay(PAGE_REQUEST_MS, function()
+            starfish.chat.sendToServer(BLOCK_LIST_COMMAND .. (page + 1))
+        end)
+    end
+end
+
+local function startSync(silent)
+    if not starfish.players.me() then return false end
+    if inLimbo() then return false end
+    if syncing then
+        if silent then return false end
+        resetSync()
+    end
+
+    syncing = true
+    silentSync = silent
+    starfish.chat.sendToServer(BLOCK_LIST_COMMAND .. "1")
+    responseTimer = starfish.timers.delay(RESPONSE_TIMEOUT_MS, abortSync)
+    return true
+end
+
+-- Server reply parsing
+
+local function isServerReply(rawMessage, colour, text)
+    return rawMessage:find(colour .. text, 1, true) ~= nil
+end
+
+local function handleBlockReply(rawMessage)
+    if not starfish.config.get("ignoreList.enabled") then return end
+
+    syncAccount()
+    local message = starfish.text.plain(rawMessage)
+
+    local blockedName = message:match("^Blocked (.+)%.$")
+    if blockedName and isServerReply(rawMessage, "§a", "Blocked") then
+        pendingBlocks[blockedName] = os.time()
+        return
+    end
+
+    local unblockedName = message:match("^Unblocked (.+)%.$")
+    if unblockedName and isServerReply(rawMessage, "§a", "Unblocked") then
+        local currentName = findIgnoreEntry(unblockedName)
+        if currentName then
+            ignoreEntries[currentName] = nil
+            saveIgnoreEntries()
+        end
+        return
+    end
+
+    if message:match("^Removed all blocked players%.?$") and isServerReply(rawMessage, "§e", "Removed all") then
+        ignoreEntries = {}
+        saveIgnoreEntries()
+        return
+    end
+
+    if message:match("^You have not blocked anyone%.$") and isServerReply(rawMessage, "§e", "You have not blocked") then
+        cancelResponseTimeout()
+        ignoreEntries = {}
+        saveIgnoreEntries()
+        syncing = false
+        silentSync = false
+        return
+    end
+
+    local page, totalPages = message:match("Blocked Players %(Page (%d+) of (%d+)%)")
+    if page then
+        onListPageHeader(tonumber(page), tonumber(totalPages))
+        return
+    end
+
+    if listParse.active then
+        local name = message:match("^%d+%.%s+(.+)$")
+        if name then
+            table.insert(listParse.names, name)
+            restartListParseTimer()
+        elseif message:match("^%-%-%-%-") then
+            finalizeListParse()
+        end
+    end
+end
+
+-- Block list presentation
+
+local function component(text, hoverText, clickAction, clickValue)
+    local c = starfish.text.of(text)
+    if hoverText then
+        c = c:hover(hoverText)
+    end
+    if clickAction == "suggest_command" then
+        c = c:suggest(clickValue)
+    elseif clickAction == "run_command" then
+        c = c:run(clickValue)
+    end
+    return c
+end
+
+local function entryHover(name, entry)
+    local lines = {}
+
+    if entry and entry.originalName and entry.originalName ~= name then
+        table.insert(lines, "§c" .. entry.originalName .. " §7→ §a" .. name)
+    else
+        table.insert(lines, "§e" .. name)
+    end
+
+    if entry then
+        table.insert(lines, "§7Added §f" .. formatAge(entry.addedAt))
+        if entry.note then
+            table.insert(lines, "§7Note: §f\"" .. entry.note .. "\"")
+        end
+    end
+
+    table.insert(lines, "")
+    table.insert(lines, "§8Click to unblock")
+    return table.concat(lines, "\n")
+end
+
+local function buildEntryLine(index, name)
+    local _, entry = findIgnoreEntry(name)
+
+    local label = "§e" .. name
+    local original = entry and entry.originalName
+    if original and original ~= name then
+        label = label .. " §8(was §7" .. original .. "§8)"
+    end
+
+    local parts = {
+        component("§b" .. index .. ". "),
+        component(label, entryHover(name, entry), "suggest_command", "/block remove " .. name),
+    }
+
+    if entry and entry.note then
+        table.insert(parts, component(" §8✎",
+            "§7\"" .. entry.note .. "\"\n§8Click to edit",
+            "suggest_command", "/denicker note " .. name .. " "))
+    end
+
+    return starfish.text.join(parts)
+end
+
+local function buildHeaderLine(page, totalPages)
+    local title = "§8§m------§r §eBlocked Players §7(Page "
+        .. page .. " of " .. totalPages .. ") §8§m------§r"
+
+    local parts = { component(title) }
+
+    if page < totalPages then
+        table.insert(parts, component(" §b»", "§7Next page",
+            "run_command", "/block list " .. (page + 1)))
+    end
+
+    return starfish.text.join(parts)
+end
+
+local function buildEmptyLine()
+    return component("§eYou have not blocked anyone.",
+        "§7Block a player: §f/block add <name>",
+        "suggest_command", "/block add ")
+end
+
+local function buildBlockedLine(name)
+    return starfish.text.join({
+        component("§aBlocked " .. name .. "."),
+        component(" §8[§aAdd Note§8]", "§7Record why you blocked §a" .. name,
+            "suggest_command", "/denicker note " .. name .. " "),
+    })
+end
+
+local function buildUnblockedLine(name)
+    return component("§aUnblocked " .. name .. ".")
+end
+
+local function isBlockListLine(rawMessage)
+    return rawMessage:match("^§e%-+ Blocked Players %(Page %d+ of %d+%) %-+$") ~= nil
+        or rawMessage:match("^§b%d+%. §e[%w_]+$") ~= nil
+        or rawMessage == "§eYou have not blocked anyone."
+end
+
+local function blockChatReplacement(rawMessage)
+    local page, totalPages = rawMessage:match("^§e%-+ Blocked Players %(Page (%d+) of (%d+)%) %-+$")
+    if page then
+        return buildHeaderLine(tonumber(page), tonumber(totalPages))
+    end
+
+    local index, listed = rawMessage:match("^§b(%d+)%. §e([%w_]+)$")
+    if index then
+        return buildEntryLine(tonumber(index), listed)
+    end
+
+    if rawMessage == "§eYou have not blocked anyone." then
+        return buildEmptyLine()
+    end
+
+    local blocked = rawMessage:match("^§aBlocked ([%w_]+)%.$")
+    if blocked then
+        return buildBlockedLine(blocked)
+    end
+
+    local unblocked = rawMessage:match("^§aUnblocked ([%w_]+)%.$")
+    if unblocked then
+        return buildUnblockedLine(unblocked)
+    end
+
+    return nil
+end
+
+local function onChatMessage(msg)
+    if msg.kind ~= "chat" then return end
+    if not starfish.config.get("ignoreList.enabled") then return end
+
+    syncAccount()
+    local rawMessage = msg.legacy
+
+    if silentSync and isBlockListLine(rawMessage) then
+        return msg:cancel()
+    end
+
+    local replacement = blockChatReplacement(rawMessage)
+    if replacement then
+        msg:setContent(replacement)
+    end
+end
 
 -- Known nick skin hashes
 
@@ -324,41 +779,49 @@ local KNOWN_NICK_SKINS = {
     ["1d9e8dafe7d87bb7cba7eb3d8d2d5bf58eab72ecdfdf9ecce3d1c03871c0"] = true,
 }
 
--- Display names
+-- Nick detection
 
-local function reset()
-    parsed = {}
-    nickDisplayNames = {}
-    pendingChecks = {}
-    teamDataReceived = {}
-    resolvedNicks = {}
-end
+local parsed = {}
+local pendingChecks = {}
+local resolvedNicks = {}
+local nickDisplayNames = {}
 
-local function clearDisplayNames()
-    for uuid, _ in pairs(nickDisplayNames) do
-        starfish.display.clearSuffix(uuid)
+local function nickSuffix(realName)
+    if realName then
+        return " §c(" .. realName .. ")"
     end
-    starfish.debug("Cleared all denicker display names")
+    return " §c[NICK]"
 end
 
 local function setNickDisplayName(uuid, nickName, realName)
     nickDisplayNames[uuid] = { nickName = nickName, realName = realName }
 
-    if getConfig("modifyDisplayNames.enabled", true) then
-        local nickSuffix
-        if realName then
-            nickSuffix = " §c(" .. realName .. ")"
-        else
-            nickSuffix = " §c[NICK]"
-        end
-        starfish.display.prependSuffix(uuid, nickSuffix)
+    if starfish.config.get("modifyDisplayNames.enabled") then
+        starfish.display.prependSuffix(uuid, nickSuffix(realName))
     end
 end
 
--- Alerts
+local function clearDisplayNames()
+    for uuid in pairs(nickDisplayNames) do
+        starfish.display.clearSuffix(uuid)
+    end
+end
+
+local function reapplyDisplayNames()
+    for uuid, data in pairs(nickDisplayNames) do
+        starfish.display.prependSuffix(uuid, nickSuffix(data.realName))
+    end
+end
+
+local function resetDetection()
+    parsed = {}
+    pendingChecks = {}
+    resolvedNicks = {}
+    nickDisplayNames = {}
+end
 
 local function sendAlert(playerName, realName)
-    if not getConfig("alerts.enabled", true) then
+    if not starfish.config.get("alerts.enabled") then
         return
     end
 
@@ -369,273 +832,44 @@ local function sendAlert(playerName, realName)
         else
             alertMsg = playerName .. "§7 is nicked."
         end
-        starfish.chat.send(starfish.chat.prefix(alertMsg))
+        starfish.chat.info(alertMsg)
 
-        if getConfig("alerts.audioAlerts.enabled", true) then
-            starfish.chat.sound("note.pling", 1.0, 1.0)
+        if starfish.config.get("alerts.audioAlerts.enabled") then
+            starfish.client.world.playSound("note.pling", { volume = 1.0, pitch = 1.0 })
         end
     end
 
-    local delay = getConfig("alerts.alertDelay", 1000)
+    local delay = starfish.config.get("alerts.alertDelay")
     if delay > 0 then
-        starfish.events.delay(delay, doSend)
+        starfish.timers.delay(delay, doSend)
     else
         doSend()
     end
 end
 
 local function sendCubelifyMessage(realName)
-    if not getConfig("addNicksToCubelify.enabled", true) then
+    if not starfish.config.get("addNicksToCubelify.enabled") then
         return
     end
 
-    local cubelifyMsg = "§cCan't find a player by the name of '+" .. realName .. "'"
-    starfish.chat.send(cubelifyMsg)
+    starfish.chat.sendToClient("§cCan't find a player by the name of '+" .. realName .. "'")
 end
 
--- Ignore list tracking
-
-local function stripColors(text)
-    return text:gsub("§.", "")
-end
-
-local function saveIgnoreEntries()
-    starfish.config.set("ignoreEntries", ignoreEntries)
-end
-
-local function formatAge(timestamp)
-    if not timestamp then return "unknown" end
-    local delta = os.time() - timestamp
-    if delta < 60 then return delta .. "s ago" end
-    if delta < 3600 then return math.floor(delta / 60) .. "m ago" end
-    if delta < 86400 then return math.floor(delta / 3600) .. "h ago" end
-    return math.floor(delta / 86400) .. "d ago"
-end
-
-local function findIgnoreEntry(name)
-    if ignoreEntries[name] then
-        return name, ignoreEntries[name]
-    end
-    local lowered = name:lower()
-    for currentName, entry in pairs(ignoreEntries) do
-        if currentName:lower() == lowered or (entry.originalName or ""):lower() == lowered then
-            return currentName, entry
-        end
+local function findTextureProperty(properties)
+    if not properties then return nil end
+    if properties.textures then return properties.textures end
+    for i = 1, #properties do
+        if properties[i].name == "textures" then return properties[i] end
     end
     return nil
 end
 
-local function formatNote(entry)
-    if not entry or not entry.note then return "" end
-    return " §7- \"" .. entry.note .. "\""
-end
-
-local function ignoreAlert(message)
-    if not getConfig("ignoreList.enabled", true) then return end
-    starfish.chat.send(starfish.chat.prefix(message))
-    if getConfig("ignoreList.sound.enabled", true) then
-        starfish.chat.sound("note.pling", 1.0, 1.2)
-    end
-end
-
-local function sawAllPages()
-    for page = 1, listParse.totalPages do
-        if not listParse.pagesSeen[page] then return false end
-    end
-    return true
-end
-
-local function processFullListDiff(listedNames)
-    local listedSet = {}
-    for _, name in ipairs(listedNames) do
-        listedSet[name] = true
-    end
-
-    local appeared = {}
-    for name in pairs(listedSet) do
-        if not ignoreEntries[name] then
-            table.insert(appeared, name)
-        end
-    end
-
-    local disappeared = {}
-    for name in pairs(ignoreEntries) do
-        if not listedSet[name] then
-            table.insert(disappeared, name)
-        end
-    end
-
-    local reveals = {}
-    for _, name in ipairs(appeared) do
-        if pendingBlocks[name] then
-            ignoreEntries[name] = { addedAt = pendingBlocks[name], originalName = name }
-            pendingBlocks[name] = nil
-        else
-            table.insert(reveals, name)
-        end
-    end
-
-    if #reveals == 1 and #disappeared == 1 then
-        local oldName, newName = disappeared[1], reveals[1]
-        local oldEntry = ignoreEntries[oldName]
-        ignoreEntries[newName] = {
-            addedAt = oldEntry.addedAt,
-            originalName = oldEntry.originalName or oldName,
-            note = oldEntry.note
-        }
-        ignoreEntries[oldName] = nil
-        ignoreAlert("§6" .. (oldEntry.originalName or oldName) .. " §7changed their nick: §c" .. oldName .. " §7→ §a" .. newName .. " §8(added " .. formatAge(oldEntry.addedAt) .. ")" .. formatNote(oldEntry))
-    else
-        for _, name in ipairs(reveals) do
-            ignoreEntries[name] = { addedAt = os.time(), originalName = name }
-            ignoreAlert("§a" .. name .. " §7appeared on your ignore list.")
-        end
-        for _, name in ipairs(disappeared) do
-            ignoreEntries[name] = nil
-        end
-    end
-
-    saveIgnoreEntries()
-end
-
-local function processPartialListAdditions(listedNames)
-    for _, name in ipairs(listedNames) do
-        if not ignoreEntries[name] then
-            ignoreEntries[name] = { addedAt = pendingBlocks[name] or os.time(), originalName = name }
-            pendingBlocks[name] = nil
-        end
-    end
-    saveIgnoreEntries()
-end
-
-local function finalizeListParse()
-    if not listParse.active then return end
-    listParse.active = false
-
-    if listParse.timer then
-        starfish.events.clearTimer(listParse.timer)
-        listParse.timer = nil
-    end
-
-    if #listParse.names > 0 then
-        if sawAllPages() then
-            processFullListDiff(listParse.names)
-        else
-            processPartialListAdditions(listParse.names)
-        end
-    end
-
-    if syncing then
-        syncing = false
-        local count = 0
-        for _ in pairs(ignoreEntries) do count = count + 1 end
-        starfish.chat.send(starfish.chat.success("Ignore list synced (" .. count .. " tracked)."))
-    end
-
-    listParse.names = {}
-    listParse.pagesSeen = {}
-end
-
-local function restartListParseTimer()
-    if listParse.timer then
-        starfish.events.clearTimer(listParse.timer)
-    end
-    listParse.timer = starfish.events.delay(1500, finalizeListParse)
-end
-
-local function onListPageHeader(page, totalPages)
-    if not listParse.active then
-        listParse.active = true
-        listParse.names = {}
-        listParse.pagesSeen = {}
-    end
-    listParse.totalPages = totalPages
-    listParse.pagesSeen[page] = true
-    restartListParseTimer()
-
-    if syncing and page < totalPages then
-        starfish.events.delay(600, function()
-            starfish.chat.sendToServer("/ignore list " .. (page + 1))
-        end)
-    end
-end
-
-local function promptForNote(name)
-    starfish.chat.sendRaw(starfish.http.jsonEncode({
-        text = starfish.chat.prefix("§7Blocked §c" .. name .. "§7. "),
-        extra = {{
-            text = "§8[§aadd note§8]",
-            hoverEvent = { action = "show_text", value = "§7Record why you blocked §c" .. name },
-            clickEvent = { action = "suggest_command", value = "/denicker note " .. name .. " " }
-        }}
-    }))
-end
-
-local function onIgnoreChat(message)
-    local blockedName = message:match("^Blocked (.+)%.$")
-    if blockedName then
-        pendingBlocks[blockedName] = os.time()
-        promptForNote(blockedName)
-        return
-    end
-
-    local removedName = message:match("^Removed (.+) from your ignore list%.$")
-    if removedName then
-        local currentName = findIgnoreEntry(removedName)
-        if currentName then
-            ignoreEntries[currentName] = nil
-            saveIgnoreEntries()
-        end
-        return
-    end
-
-    if message:match("^Removed all blocked players%.?$") then
-        ignoreEntries = {}
-        saveIgnoreEntries()
-        return
-    end
-
-    local page, totalPages = message:match("Blocked Players %(Page (%d+) of (%d+)%)")
-    if page then
-        onListPageHeader(tonumber(page), tonumber(totalPages))
-        return
-    end
-
-    if listParse.active then
-        local name = message:match("^%d+%.%s+(.+)$")
-        if name then
-            table.insert(listParse.names, name)
-            restartListParseTimer()
-        elseif message:match("^%-%-%-%-") then
-            finalizeListParse()
-        end
-    end
-end
-
--- Nick detection
-
 local function parseSkinData(player, team)
-    local uuid = player.uuid
-    local name = player.name
-    local properties = player.properties
-
-    if not properties then
-        local playerInfo = starfish.players.getInfo(uuid)
-        if playerInfo then
-            properties = playerInfo.properties
-        end
+    local textureProp = findTextureProperty(player.properties)
+    if not textureProp then
+        local playerInfo = starfish.players.byUuid(player.uuid)
+        textureProp = playerInfo and findTextureProperty(playerInfo.properties)
     end
-
-    if not properties then return end
-
-    local textureProp = nil
-    for i = 1, #properties do
-        if properties[i].name == "textures" then
-            textureProp = properties[i]
-            break
-        end
-    end
-
     if not textureProp or not textureProp.value then return end
 
     local skinDataJson = starfish.base64.decode(textureProp.value)
@@ -643,7 +877,6 @@ local function parseSkinData(player, team)
 
     local success, skinData = pcall(json.decode, skinDataJson)
     if not success or not skinData then return end
-
     if not skinData.textures or not skinData.textures.SKIN then return end
 
     local url = skinData.textures.SKIN.url
@@ -652,29 +885,29 @@ local function parseSkinData(player, team)
     local hash = url:match("[^/]+$")
     local prefix = team and team.prefix or ""
     local suffix = team and team.suffix or ""
-    local teamFormattedName = prefix .. name .. suffix
+    local teamFormattedName = prefix .. player.name .. suffix
 
     if KNOWN_NICK_SKINS[hash] then
-        starfish.debug("Unresolved nick: " .. name)
-        if getConfig("showUnresolvedNicks.enabled", true) then
+        starfish.log.debug("Unresolved nick: " .. player.name)
+        if starfish.config.get("showUnresolvedNicks.enabled") then
             sendAlert(teamFormattedName, nil)
         end
-        setNickDisplayName(uuid, name, nil)
+        setNickDisplayName(player.uuid, player.name, nil)
         return
     end
 
     local realName = skinData.profileName
-    if realName and realName ~= name then
-        starfish.debug("Resolved nick: " .. name .. " -> " .. realName)
-        resolvedNicks[name] = realName
+    if realName and realName ~= player.name then
+        starfish.log.debug("Resolved nick: " .. player.name .. " -> " .. realName)
+        resolvedNicks[player.name] = realName
         starfish.events.emit("denicker:nick_resolved", {
-            nickName = name,
+            nickName = player.name,
             realName = realName,
-            uuid = uuid
+            uuid = player.uuid
         })
         sendCubelifyMessage(realName)
         sendAlert(teamFormattedName, realName)
-        setNickDisplayName(uuid, name, realName)
+        setNickDisplayName(player.uuid, player.name, realName)
 
         local _, entry = findIgnoreEntry(realName)
         if entry then
@@ -683,85 +916,53 @@ local function parseSkinData(player, team)
     end
 end
 
+local function isNickUuid(uuid)
+    return uuid ~= nil and #uuid >= 15 and uuid:sub(15, 15) == "1"
+end
+
+local function resolveTeam(name)
+    local player = starfish.players.byName(name)
+    return player and player.team
+end
+
 local function onPlayerInfo(event)
-    if event.action ~= 0 then return end
+    if event.action ~= "add" then return end
 
-    local players = event.players or {}
-    for _, playerData in ipairs(players) do
-        if playerData.name and type(playerData.name) == "string" then
-            local uuid = playerData.uuid
-            if uuid and #uuid >= 15 and uuid:sub(15, 15) == "1" then
-                if not parsed[uuid] then
-                    local player = {
-                        uuid = uuid,
-                        name = playerData.name,
-                        properties = playerData.properties
-                    }
+    for _, playerData in ipairs(event.players or {}) do
+        local uuid = playerData.uuid
+        if type(playerData.name) == "string" and isNickUuid(uuid) and not parsed[uuid] then
+            local player = { uuid = uuid, name = playerData.name, properties = playerData.properties }
 
-                    local team = starfish.players.getTeam(player.name)
-                    if team then
-                        teamDataReceived[player.name] = true
-                        parseSkinData(player, team)
-                        parsed[uuid] = true
-                    else
-                        pendingChecks[player.name] = player
-                    end
-                end
+            local team = resolveTeam(player.name)
+            if team then
+                parseSkinData(player, team)
+                parsed[uuid] = true
+            else
+                pendingChecks[player.name] = player
             end
         end
     end
 end
 
 local function onTeamUpdate(event)
-    local mode = event.mode
-    if mode == 0 or mode == 2 or mode == 3 then
-        for playerName, player in pairs(pendingChecks) do
-            local team = starfish.players.getTeam(playerName)
-            if team then
-                teamDataReceived[playerName] = true
-                parseSkinData(player, team)
-                parsed[player.uuid] = true
-                pendingChecks[playerName] = nil
-            end
+    if event.mode ~= "create" and event.mode ~= "update" and event.mode ~= "addPlayers" then return end
+
+    for playerName, player in pairs(pendingChecks) do
+        local team = resolveTeam(playerName)
+        if team then
+            parseSkinData(player, team)
+            parsed[player.uuid] = true
+            pendingChecks[playerName] = nil
         end
     end
 end
 
 -- Event wiring
 
-local function onRespawn(event)
-    clearDisplayNames()
-    reset()
-end
-
-local function onPluginRestored(event)
-    if event.pluginName == "denicker" then
-        parsed = {}
-        pendingChecks = {}
-        teamDataReceived = {}
-    end
-end
-
-local function reapplyDisplayNames()
-    if not getConfig("modifyDisplayNames.enabled", true) then
-        return
-    end
-    for uuid, data in pairs(nickDisplayNames) do
-        local nickSuffix
-        if data.realName then
-            nickSuffix = " §c(" .. data.realName .. ")"
-        else
-            nickSuffix = " §c[NICK]"
-        end
-        starfish.display.prependSuffix(uuid, nickSuffix)
-    end
-end
+local recentCommand = false
+local recentCommandTimer = nil
 
 local function onConfigChanged(event)
-    if event.plugin ~= "denicker" then
-        return
-    end
-
     if event.key == "modifyDisplayNames.enabled" then
         if event.value == false then
             clearDisplayNames()
@@ -769,88 +970,96 @@ local function onConfigChanged(event)
             reapplyDisplayNames()
         end
     end
+end
 
-    if event.key == "enabled" then
-        if event.value == false then
-            clearDisplayNames()
-            reset()
-        end
+starfish.events.on("player:listUpdate", onPlayerInfo)
+starfish.events.on("team:update", onTeamUpdate)
+starfish.events.on("config:changed", onConfigChanged)
+starfish.chat.onReceive(onChatMessage)
+
+starfish.events.on("chat:receive", function(event)
+    if event.kind == "actionBar" then return end
+    handleBlockReply(event.message or "")
+end)
+
+starfish.events.on("chat:send", function(event)
+    local command = (event.message or ""):lower()
+    if command:sub(1, 1) ~= "/" then return end
+
+    if command:match("^/block%s+list") or command:match("^/ignore%s+list") then
+        silentSync = false
     end
-end
 
-local function onChat(event)
-    if event.position == 2 then return end
-    onIgnoreChat(stripColors(event.message or ""))
-end
+    recentCommand = true
+    if recentCommandTimer then
+        recentCommandTimer:off()
+    end
+    recentCommandTimer = starfish.timers.delay(COMMAND_QUIET_MS, function()
+        recentCommand = false
+        recentCommandTimer = nil
+    end)
+end)
 
-starfish.events.on("player_info", onPlayerInfo)
-starfish.events.on("scoreboard_team", onTeamUpdate)
-starfish.events.on("chat", onChat)
-starfish.events.on("respawn", onRespawn)
-starfish.events.on("plugin_restored", onPluginRestored)
-starfish.events.on("config_changed", onConfigChanged)
+starfish.timers.interval(AUTO_SYNC_MS, function()
+    if starfish.config.get("ignoreList.enabled") and starfish.config.get("ignoreList.auto") and not recentCommand then
+        startSync(true)
+    end
+end)
 
-ignoreEntries = starfish.config.get("ignoreEntries") or {}
+starfish.events.on("world:respawn", function()
+    clearDisplayNames()
+    resetDetection()
+end)
+
+starfish.events.on("hypixel:location", function(event)
+    if event.success and event.location then
+        currentServer = event.location.serverName
+    end
+end)
+
+starfish.events.on("session:join", loadIgnoreEntries)
+
+loadIgnoreEntries()
 
 -- Commands
 
 starfish.commands.register("sync", {
-    description = "Sync your ignore list by paging through /ignore list"
+    description = "Re-read your block list now, paging through every page"
 }, function()
-    syncing = true
-    starfish.chat.send(starfish.chat.prefix("§7Syncing ignore list..."))
-    starfish.chat.sendToServer("/ignore list 1")
-end)
-
-starfish.commands.register("changed", {
-    description = "Show ignore list entries whose name changed since they were added"
-}, function()
-    local changed = {}
-    for name, entry in pairs(ignoreEntries) do
-        if entry.originalName and entry.originalName ~= name then
-            table.insert(changed, { name = name, entry = entry })
-        end
-    end
-
-    if #changed == 0 then
-        starfish.chat.send(starfish.chat.prefix("§7No nick changes detected yet."))
+    if not starfish.config.get("ignoreList.enabled") then
+        starfish.chat.error("Block List Tracker is turned off.")
         return
     end
-
-    table.sort(changed, function(a, b)
-        return (a.entry.addedAt or 0) < (b.entry.addedAt or 0)
-    end)
-
-    starfish.chat.send(starfish.chat.prefix("§7Nick changes detected (" .. #changed .. "):"))
-    for _, item in ipairs(changed) do
-        starfish.chat.send(starfish.chat.prefix("§c" .. item.entry.originalName .. " §7→ §a" .. item.name .. " §8(added " .. formatAge(item.entry.addedAt) .. ")" .. formatNote(item.entry)))
+    if inLimbo() then
+        starfish.chat.error("/block does not work in limbo.")
+        return
     end
+    if not startSync(false) then
+        starfish.chat.error("Not connected to a server.")
+        return
+    end
+    starfish.chat.info("§7Syncing block list...")
 end)
 
 starfish.commands.register("note", {
     description = "Record why you blocked a player (no text shows it, \"clear\" removes it)",
     arguments = {
-        starfish.commands.arg("player", "Blocked player's name"),
-        starfish.commands.greedy("text", "Note text")
+        { name = "player", type = "string", description = "Blocked player's name" },
+        { name = "text", type = "greedy", optional = true, description = "Note text" }
     }
-}, function(args)
-    if #args == 0 then
-        starfish.chat.send(starfish.chat.error("Usage: /denicker note <player> [text]"))
-        return
-    end
-
-    local name, entry = findIgnoreEntry(args[1])
+}, function(ctx)
+    local name, entry = findIgnoreEntry(ctx.args.player)
     if not entry then
-        starfish.chat.send(starfish.chat.error(args[1] .. " is not on your tracked ignore list. Run /denicker sync first."))
+        starfish.chat.error(ctx.args.player .. " is not on your tracked ignore list. Run /denicker sync first.")
         return
     end
 
-    local text = table.concat(args, " ", 2)
+    local text = ctx.args.text or ""
     if text == "" then
         if entry.note then
-            starfish.chat.send(starfish.chat.prefix("§c" .. name .. formatNote(entry)))
+            starfish.chat.info("§c" .. name .. formatNote(entry))
         else
-            starfish.chat.send(starfish.chat.prefix("§7No note for §c" .. name .. "§7. Add one: §f/denicker note " .. name .. " <text>"))
+            starfish.chat.info("§7No note for §c" .. name .. "§7. Add one: §f/denicker note " .. name .. " <text>")
         end
         return
     end
@@ -858,46 +1067,19 @@ starfish.commands.register("note", {
     if text == "clear" then
         entry.note = nil
         saveIgnoreEntries()
-        starfish.chat.send(starfish.chat.success("Cleared the note for " .. name .. "."))
+        starfish.chat.success("Cleared the note for " .. name .. ".")
         return
     end
 
     entry.note = text
     saveIgnoreEntries()
-    starfish.chat.send(starfish.chat.success("Noted for " .. name .. ": §7\"" .. text .. "\""))
-end)
-
-starfish.commands.register("list", {
-    description = "List tracked ignore entries with their notes"
-}, function()
-    local entries = {}
-    for name, entry in pairs(ignoreEntries) do
-        table.insert(entries, { name = name, entry = entry })
-    end
-
-    if #entries == 0 then
-        starfish.chat.send(starfish.chat.prefix("§7No tracked players. Run /denicker sync to import your ignore list."))
-        return
-    end
-
-    table.sort(entries, function(a, b)
-        return (a.entry.addedAt or 0) < (b.entry.addedAt or 0)
-    end)
-
-    starfish.chat.send(starfish.chat.prefix("§7Tracked ignore list (" .. #entries .. "):"))
-    for _, item in ipairs(entries) do
-        local renamed = ""
-        if item.entry.originalName and item.entry.originalName ~= item.name then
-            renamed = " §8(was " .. item.entry.originalName .. ")"
-        end
-        starfish.chat.send(starfish.chat.prefix("§c" .. item.name .. renamed .. " §8(added " .. formatAge(item.entry.addedAt) .. ")" .. formatNote(item.entry)))
-    end
+    starfish.chat.success("Noted for " .. name .. ": §7\"" .. text .. "\"")
 end)
 
 -- Exports
 
-starfish.api.export("isNicked", function(playerName)
-    for uuid, data in pairs(nickDisplayNames) do
+starfish.plugin.export("isNicked", function(playerName)
+    for _, data in pairs(nickDisplayNames) do
         if data.nickName == playerName then
             return true
         end
@@ -905,11 +1087,11 @@ starfish.api.export("isNicked", function(playerName)
     return false
 end)
 
-starfish.api.export("getRealName", function(nickName)
+starfish.plugin.export("getRealName", function(nickName)
     return resolvedNicks[nickName]
 end)
 
-starfish.api.export("getNickedPlayers", function()
+starfish.plugin.export("getNickedPlayers", function()
     local result = {}
     for uuid, data in pairs(nickDisplayNames) do
         table.insert(result, {
@@ -921,22 +1103,7 @@ starfish.api.export("getNickedPlayers", function()
     return result
 end)
 
-starfish.api.export("isIgnored", function(name)
-    if not name then return false end
-    return findIgnoreEntry(name) ~= nil
-end)
-
-starfish.api.export("getIgnoreEntry", function(name)
-    if not name then return nil end
-    local currentName, entry = findIgnoreEntry(name)
-    if not entry then return nil end
-    return { name = currentName, addedAt = entry.addedAt, originalName = entry.originalName, note = entry.note }
-end)
-
-starfish.api.export("getIgnoreEntries", function()
-    local result = {}
-    for name, entry in pairs(ignoreEntries) do
-        result[name] = { addedAt = entry.addedAt, originalName = entry.originalName, note = entry.note }
-    end
-    return result
-end)
+function plugin.onDisable()
+    clearDisplayNames()
+    resetDetection()
+end
