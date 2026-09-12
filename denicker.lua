@@ -2,7 +2,7 @@ plugin = {
     name = "denicker",
     displayName = "Nick Alerts",
     prefix = "§cDN",
-    version = "1.5.0",
+    version = "1.5.1",
     author = "pugbw, hxrmcny",
     credits = "pugbw, hxrmcny",
     description = "Detects and resolves nicked players, and tracks nick changes on your ignore list"
@@ -76,6 +76,8 @@ starfish.schema.section({
 })
 
 -- Account storage
+
+starfish.config.defaults({ accounts = {} })
 
 local ignoreEntries = {}
 local loadedAccount = nil
