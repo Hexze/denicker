@@ -1,0 +1,15 @@
+{
+  "name": "denicker",
+  "display_name": "Nick Alerts",
+  "version": "1.0.0",
+  "description": "Detects and resolves nicked players when possible",
+  "homepage": null,
+  "dependencies": [
+    {
+      "name": "hypixel-mod-api",
+      "version": null,
+      "optional": false
+    }
+  ],
+  "min_starfish_version": null
+}
