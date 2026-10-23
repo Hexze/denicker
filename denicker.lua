@@ -2,7 +2,7 @@ plugin = {
     name = "denicker",
     displayName = "Nick Alerts",
     prefix = "§cDN",
-    version = "1.0.0",
+    version = "1.0.1",
     description = "Detects and resolves nicked players when possible",
     credits = "pugbw, hxrmcny",
     dependencies = {
@@ -1120,20 +1120,17 @@ local function isNpc(player)
     return player.team ~= nil and player.team.nameTagVisibility == HIDDEN_NAME_TAG
 end
 
-local function fullName(player)
-    if #player.name < RECORDED_NAME_LIMIT or not player.team then
-        return player.name
-    end
-
-    local extended = player.name .. starfish.text.plain(player.team.suffix)
-    if #extended <= PROFILE_NAME_LIMIT and extended:match("^[%w_]+$") then
-        return extended
-    end
-    return player.name
+local function continuesTruncatedName(player, profileName)
+    return player.recorded
+        and #player.name == RECORDED_NAME_LIMIT
+        and #profileName <= PROFILE_NAME_LIMIT
+        and profileName:sub(1, RECORDED_NAME_LIMIT) == player.name
 end
 
 local function wearsOtherProfile(player, skin)
-    return skin.profileName ~= nil and skin.profileName ~= fullName(player)
+    local profileName = skin.profileName
+    if profileName == nil or profileName == player.name then return false end
+    return not continuesTruncatedName(player, profileName)
 end
 
 local function wearsPoolSkin(skin)
