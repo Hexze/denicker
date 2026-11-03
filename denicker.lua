@@ -2,7 +2,8 @@ plugin = {
     name = "denicker",
     displayName = "Nick Alerts",
     prefix = "§cDN",
-    version = "1.0.1",
+    version = "1.0.2",
+    minStarfishVersion = "0.1.0-beta.17",
     description = "Detects and resolves nicked players when possible",
     credits = "pugbw, hxrmcny",
     dependencies = {
@@ -289,6 +290,15 @@ starfish.schema.section({
     description = "Mark nicked players in the tab list, with their real name when known.",
     settings = {
         { key = "modifyDisplayNames.enabled", type = "toggle", default = true, label = "Enabled", description = "Turn nick labels on or off." },
+    }
+})
+
+starfish.schema.section({
+    key = "nametags",
+    label = "Label Nicks in Nametags",
+    description = "Mark nicked players' nametags with [NICK], unless another plugin tags them. Skips players on your own team due to Minecraft limitations.",
+    settings = {
+        { key = "nametags.enabled", type = "toggle", default = true, label = "Enabled", description = "Turn nametag labels on or off." },
     }
 })
 
@@ -854,6 +864,9 @@ local function validProfileUuid(profileId)
     return nil
 end
 
+local NICK_NAMETAG = " §c[NICK]"
+local BEHIND_OTHER_TAGS = { priority = 1 }
+
 local function nickSuffix(realName)
     if realName then
         return " §c(" .. realName .. ")"
@@ -867,6 +880,9 @@ local function setNickDisplayName(uuid, nickName, realName)
     if starfish.config.get("modifyDisplayNames.enabled") then
         starfish.display.prependSuffix(uuid, nickSuffix(realName))
     end
+    if starfish.config.get("nametags.enabled") then
+        starfish.display.setNametagSuffix(uuid, NICK_NAMETAG, BEHIND_OTHER_TAGS)
+    end
 end
 
 local function clearDisplayNames()
@@ -878,6 +894,18 @@ end
 local function reapplyDisplayNames()
     for uuid, data in pairs(nickDisplayNames) do
         starfish.display.prependSuffix(uuid, nickSuffix(data.realName))
+    end
+end
+
+local function clearNametags()
+    for uuid in pairs(nickDisplayNames) do
+        starfish.display.clearNametagSuffix(uuid)
+    end
+end
+
+local function reapplyNametags()
+    for uuid in pairs(nickDisplayNames) do
+        starfish.display.setNametagSuffix(uuid, NICK_NAMETAG, BEHIND_OTHER_TAGS)
     end
 end
 
@@ -1267,6 +1295,14 @@ starfish.config.onChange("modifyDisplayNames.enabled", function(enabled)
     end
 end)
 
+starfish.config.onChange("nametags.enabled", function(enabled)
+    if enabled == false then
+        clearNametags()
+    else
+        reapplyNametags()
+    end
+end)
+
 starfish.events.on("chat:receive", function(event)
     if event.kind == "actionBar" then return end
     handleBlockReply(event.message or "")
@@ -1299,6 +1335,7 @@ end)
 
 starfish.events.on("world:respawn", function()
     clearDisplayNames()
+    clearNametags()
     resetDetection()
 end)
 
