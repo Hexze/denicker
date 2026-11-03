@@ -1,8 +1,9 @@
 {
   "name": "denicker",
   "display_name": "Nick Alerts",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Detects and resolves nicked players when possible",
+  "prefix": "§cDN",
   "homepage": null,
   "dependencies": [
     {
@@ -11,5 +12,15 @@
       "optional": false
     }
   ],
-  "min_starfish_version": null
+  "commands": [
+    {
+      "usage": "/note <player> [text]",
+      "description": "Record why you blocked a player (no text shows it, \"clear\" removes it)"
+    },
+    {
+      "usage": "/sync",
+      "description": "Re-read your block list now, paging through every page"
+    }
+  ],
+  "min_starfish_version": "0.1.0-beta.17"
 }
